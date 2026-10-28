@@ -82,6 +82,12 @@ type ProductReport = {
   transactionCount: number;
   formulaResultRows: number;
 };
+type ConsolidatedWorkbook = {
+  name: string;
+  headers: string[];
+  rows: Cell[][];
+  sheets: string[];
+};
 type ProductReportFilter = "all" | "complete" | "incomplete" | "no-sales";
 type ComparisonSource = WorkbookData & {
   id: string;
@@ -180,6 +186,9 @@ const MONTH_LOOKUP: Record<string, number> = {
 
 const PALETTE = ["#356f51", "#dda957", "#83a88b", "#c8885c", "#697e67"];
 const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
+const MAX_EXCEL_ROWS = 1_048_576;
+const MAX_EXCEL_COLUMNS = 16_384;
+const CONSOLIDATION_CHUNK_SIZE = 10_000;
 
 function cleanHeader(value: unknown, index: number) {
   const header = String(value ?? "").trim();
@@ -725,6 +734,7 @@ export default function Home() {
   const inputRef = useRef<HTMLInputElement>(null);
   const comparisonInputRef = useRef<HTMLInputElement>(null);
   const topProductsInputRef = useRef<HTMLInputElement>(null);
+  const consolidationInputRef = useRef<HTMLInputElement>(null);
   const [darkMode, setDarkMode] = useState(false);
   const [themeReady, setThemeReady] = useState(false);
   const [workbook, setWorkbook] = useState<WorkbookData | null>(null);
@@ -738,6 +748,13 @@ export default function Home() {
   const [topProductsLoading, setTopProductsLoading] = useState(false);
   const [topProductsError, setTopProductsError] = useState("");
   const [topProductsDragging, setTopProductsDragging] = useState(false);
+  const [consolidationWorkbook, setConsolidationWorkbook] =
+    useState<ConsolidatedWorkbook | null>(null);
+  const [consolidationLoading, setConsolidationLoading] = useState(false);
+  const [consolidationExporting, setConsolidationExporting] = useState(false);
+  const [consolidationDragging, setConsolidationDragging] = useState(false);
+  const [consolidationProgress, setConsolidationProgress] = useState("");
+  const [consolidationError, setConsolidationError] = useState("");
   const [productSeller, setProductSeller] = useState("Todos");
   const [productStatus, setProductStatus] =
     useState<ProductReportFilter>("all");
@@ -758,7 +775,7 @@ export default function Home() {
   const [filters, setFilters] = useState<DimensionFilter[]>([]);
   const [savedComparisons, setSavedComparisons] = useState<SavedComparison[]>([]);
   const [activePage, setActivePage] = useState<
-    "overview" | "data" | "top-products"
+    "overview" | "data" | "top-products" | "consolidate"
   >("overview");
   const productSellerRows = useMemo(
     () =>
@@ -1537,6 +1554,220 @@ export default function Home() {
     XLSX.writeFile(book, `comparativa-${workbook.name.replace(/\.[^.]+$/, "")}.xlsx`);
   }
 
+  async function loadConsolidationFile(file: File) {
+    setConsolidationLoading(true);
+    setConsolidationWorkbook(null);
+    setConsolidationError("");
+    setConsolidationProgress("Preparando el archivo…");
+    try {
+      if (file.size > MAX_UPLOAD_BYTES) {
+        throw new Error("El archivo supera el límite de 50 MB.");
+      }
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+      const buffer = await file.arrayBuffer();
+      const sourceWorkbook = XLSX.read(buffer, { type: "array", cellDates: true });
+      const schemas: {
+        name: string;
+        worksheet: XLSX.WorkSheet;
+        range: XLSX.Range;
+        headers: string[];
+        outputIndexes: number[];
+      }[] = [];
+      const outputHeaders: string[] = [];
+      const outputHeaderIndexes = new Map<string, number>();
+
+      for (const name of sourceWorkbook.SheetNames) {
+        const worksheet = sourceWorkbook.Sheets[name];
+        if (!worksheet?.["!ref"]) continue;
+        const range = XLSX.utils.decode_range(worksheet["!ref"]);
+        if (range.e.r <= range.s.r) continue;
+        const headerRows = XLSX.utils.sheet_to_json<unknown[]>(worksheet, {
+          header: 1,
+          range: {
+            s: { r: range.s.r, c: range.s.c },
+            e: { r: range.s.r, c: range.e.c },
+          },
+          raw: true,
+          blankrows: false,
+        });
+        const rawHeaders = headerRows[0] ?? [];
+        if (!rawHeaders.some((value) => String(value ?? "").trim())) continue;
+
+        const seenHeaders = new Map<string, number>();
+        const headers = rawHeaders.map((value, index) => {
+          const header = cleanHeader(value, index);
+          const key = normalizeText(header);
+          const count = (seenHeaders.get(key) ?? 0) + 1;
+          seenHeaders.set(key, count);
+          return count > 1 ? `${header} (${count})` : header;
+        });
+        const outputIndexes = headers.map((header) => {
+          const key = normalizeText(header);
+          const existingIndex = outputHeaderIndexes.get(key);
+          if (existingIndex !== undefined) return existingIndex;
+          const index = outputHeaders.length;
+          outputHeaders.push(header);
+          outputHeaderIndexes.set(key, index);
+          return index;
+        });
+        schemas.push({ name, worksheet, range, headers, outputIndexes });
+      }
+
+      if (schemas.length === 0) {
+        throw new Error("No encontramos hojas con encabezados y filas de datos.");
+      }
+      let sourceHeader = "Hoja de origen";
+      let sourceHeaderSuffix = 2;
+      while (outputHeaderIndexes.has(normalizeText(sourceHeader))) {
+        sourceHeader = `Hoja de origen ${sourceHeaderSuffix}`;
+        sourceHeaderSuffix += 1;
+      }
+      if (outputHeaders.length + 1 > MAX_EXCEL_COLUMNS) {
+        throw new Error("La unión supera el máximo de 16.384 columnas que admite Excel.");
+      }
+
+      const rows: Cell[][] = [];
+      const includedSheets: string[] = [];
+      for (const [sheetIndex, schema] of schemas.entries()) {
+        const firstDataRow = schema.range.s.r + 1;
+        let includedSheet = false;
+        for (
+          let startRow = firstDataRow;
+          startRow <= schema.range.e.r;
+          startRow += CONSOLIDATION_CHUNK_SIZE
+        ) {
+          const endRow = Math.min(
+            startRow + CONSOLIDATION_CHUNK_SIZE - 1,
+            schema.range.e.r,
+          );
+          setConsolidationProgress(
+            `Leyendo hoja ${sheetIndex + 1} de ${schemas.length}: ${schema.name}`,
+          );
+          await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+          const rawRows = XLSX.utils.sheet_to_json<unknown[]>(schema.worksheet, {
+            header: 1,
+            range: {
+              s: { r: startRow, c: schema.range.s.c },
+              e: { r: endRow, c: schema.range.e.c },
+            },
+            defval: null,
+            raw: true,
+            blankrows: false,
+          });
+          for (const rawRow of rawRows) {
+            if (
+              !rawRow.some(
+                (value) =>
+                  value !== null &&
+                  value !== undefined &&
+                  (typeof value !== "string" || value.trim() !== ""),
+              )
+            ) {
+              continue;
+            }
+            if (rows.length >= MAX_EXCEL_ROWS - 1) {
+              throw new Error(
+                "La combinación supera el máximo de 1.048.576 filas por hoja de Excel. Dividí los datos en varios archivos para conservarlos todos.",
+              );
+            }
+            const row: Cell[] = Array(outputHeaders.length + 1).fill(null);
+            row[0] = schema.name;
+            schema.outputIndexes.forEach((outputIndex, columnIndex) => {
+              const value = rawRow[columnIndex];
+              row[outputIndex + 1] =
+                value instanceof Date ||
+                typeof value === "string" ||
+                typeof value === "number" ||
+                typeof value === "boolean"
+                  ? value
+                  : null;
+            });
+            rows.push(row);
+            includedSheet = true;
+          }
+        }
+        if (includedSheet) includedSheets.push(schema.name);
+      }
+
+      if (rows.length === 0) {
+        throw new Error("Las hojas no contienen filas con datos para consolidar.");
+      }
+      setConsolidationWorkbook({
+        name: file.name,
+        headers: [sourceHeader, ...outputHeaders],
+        rows,
+        sheets: includedSheets,
+      });
+      setConsolidationProgress("");
+    } catch (fileError) {
+      setConsolidationError(
+        fileError instanceof Error
+          ? fileError.message
+          : "No pudimos consolidar el archivo. Verificá que sea un Excel válido.",
+      );
+      setConsolidationProgress("");
+    } finally {
+      setConsolidationLoading(false);
+    }
+  }
+
+  function handleConsolidationFileChange(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    if (file) void loadConsolidationFile(file);
+    event.target.value = "";
+  }
+
+  function handleConsolidationDrop(event: DragEvent<HTMLDivElement>) {
+    event.preventDefault();
+    setConsolidationDragging(false);
+    const file = event.dataTransfer.files?.[0];
+    if (file) void loadConsolidationFile(file);
+  }
+
+  async function exportConsolidatedWorkbook() {
+    if (!consolidationWorkbook) return;
+    setConsolidationExporting(true);
+    setConsolidationError("");
+    try {
+      const worksheet = XLSX.utils.aoa_to_sheet([consolidationWorkbook.headers]);
+      for (
+        let start = 0;
+        start < consolidationWorkbook.rows.length;
+        start += CONSOLIDATION_CHUNK_SIZE
+      ) {
+        const end = Math.min(
+          start + CONSOLIDATION_CHUNK_SIZE,
+          consolidationWorkbook.rows.length,
+        );
+        setConsolidationProgress(
+          `Preparando descarga: ${end.toLocaleString("es-AR")} de ${consolidationWorkbook.rows.length.toLocaleString("es-AR")} filas`,
+        );
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+        XLSX.utils.sheet_add_aoa(
+          worksheet,
+          consolidationWorkbook.rows.slice(start, end),
+          { origin: -1 },
+        );
+      }
+      const outputWorkbook = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(outputWorkbook, worksheet, "Datos unificados");
+      const baseName = consolidationWorkbook.name
+        .replace(/\.[^.]+$/, "")
+        .replace(/[<>:"|?*]/g, "-");
+      XLSX.writeFile(outputWorkbook, `${baseName}-hojas-unidas.xlsx`);
+      setConsolidationProgress("");
+    } catch (exportError) {
+      setConsolidationError(
+        exportError instanceof Error
+          ? `No pudimos crear el Excel unificado: ${exportError.message}`
+          : "No pudimos crear el Excel unificado.",
+      );
+      setConsolidationProgress("");
+    } finally {
+      setConsolidationExporting(false);
+    }
+  }
+
   function persistSavedComparisons(comparisons: SavedComparison[]) {
     try {
       window.localStorage.setItem(
@@ -1782,6 +2013,13 @@ export default function Home() {
           >
             <Award size={18} /><span>Los 5 productos</span>
           </button>
+          <button
+            className={`nav-item ${activePage === "consolidate" ? "active" : ""}`}
+            onClick={() => setActivePage("consolidate")}
+            type="button"
+          >
+            <Layers3 size={18} /><span>Unir hojas</span>
+          </button>
         </nav>
 
         <div className="sidebar-divider" />
@@ -1826,7 +2064,7 @@ export default function Home() {
 
       <section className="main-panel">
         <header className="topbar">
-          <div className="breadcrumb"><span>Mi espacio</span><span className="crumb-separator">/</span><strong>{activePage === "overview" ? "Vista general" : activePage === "data" ? "Explorar datos" : "Los 5 productos"}</strong></div>
+          <div className="breadcrumb"><span>Mi espacio</span><span className="crumb-separator">/</span><strong>{activePage === "overview" ? "Vista general" : activePage === "data" ? "Explorar datos" : activePage === "top-products" ? "Los 5 productos" : "Unir hojas"}</strong></div>
           <div className="topbar-actions">
             <button
               className="theme-toggle"
@@ -1846,7 +2084,95 @@ export default function Home() {
         </header>
 
         <div className="content">
-          {activePage === "top-products" ? (
+          {activePage === "consolidate" ? (
+            <section className="consolidate-screen">
+              <div className="welcome-topline"><span className="eyebrow-dot" /> HERRAMIENTA PARA TUS EXCEL</div>
+              <h1>Uní todas tus hojas.</h1>
+              <p className="welcome-description">
+                Cargá un Excel y reuní las filas de sus hojas en una sola planilla,
+                lista para analizar.
+              </p>
+              <div
+                className={`upload-card ${consolidationDragging ? "dragging" : ""} ${consolidationLoading ? "is-loading" : ""}`}
+                onDragEnter={(event) => { event.preventDefault(); setConsolidationDragging(true); }}
+                onDragOver={(event) => event.preventDefault()}
+                onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node)) setConsolidationDragging(false); }}
+                onDrop={handleConsolidationDrop}
+                onClick={() => !consolidationLoading && consolidationInputRef.current?.click()}
+                role="button"
+                tabIndex={0}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    consolidationInputRef.current?.click();
+                  }
+                }}
+              >
+                <div className="upload-icon">
+                  {consolidationLoading ? <LoaderCircle className="spin" size={23} /> : <Layers3 size={23} />}
+                </div>
+                <div className="upload-copy">
+                  <strong>{consolidationLoading ? "Estamos uniendo tus hojas…" : consolidationWorkbook ? "Cargar otro Excel" : "Arrastrá tu Excel acá"}</strong>
+                  <span>{consolidationLoading ? consolidationProgress : "o hacé clic para buscarlo en tu computadora"}</span>
+                </div>
+                {!consolidationLoading && (
+                  <button className="browse-button" type="button">
+                    Elegir archivo <ArrowRight size={15} />
+                  </button>
+                )}
+                <input
+                  ref={consolidationInputRef}
+                  className="visually-hidden"
+                  type="file"
+                  accept=".xlsx,.xls"
+                  onChange={handleConsolidationFileChange}
+                  aria-label="Subir Excel para unir sus hojas"
+                />
+              </div>
+              <div className="upload-footnote">
+                <LockKeyhole size={13} /> Hasta 50 MB y 1.048.576 filas en el archivo final; el tiempo depende de tu computadora.
+              </div>
+              {consolidationError && (
+                <div className="error-message" role="alert">
+                  <CircleHelp size={16} />{consolidationError}
+                </div>
+              )}
+              {consolidationWorkbook && (
+                <section className="consolidation-result" aria-live="polite">
+                  <div className="consolidation-result-heading">
+                    <span className="summary-file-icon"><FileSpreadsheet size={19} /></span>
+                    <div className="summary-file-copy">
+                      <strong>{consolidationWorkbook.name}</strong>
+                      <span>
+                        {consolidationWorkbook.rows.length.toLocaleString("es-AR")} filas reunidas de{" "}
+                        {consolidationWorkbook.sheets.length.toLocaleString("es-AR")} hojas ·{" "}
+                        {consolidationWorkbook.headers.length.toLocaleString("es-AR")} columnas
+                      </span>
+                    </div>
+                    <span className="file-ready"><Check size={14} /> Listo</span>
+                  </div>
+                  <div className="consolidation-note">
+                    <Layers3 size={15} />
+                    <span>
+                      Las columnas se alinean por encabezado; si una hoja no tiene una
+                      columna, sus celdas quedan vacías. Se agrega “
+                      {consolidationWorkbook.headers[0]}” para identificar de dónde salió
+                      cada fila.
+                    </span>
+                  </div>
+                  <button
+                    className="export-button consolidation-download"
+                    onClick={() => void exportConsolidatedWorkbook()}
+                    type="button"
+                    disabled={consolidationExporting}
+                  >
+                    {consolidationExporting ? <LoaderCircle className="spin" size={15} /> : <Download size={15} />}
+                    {consolidationExporting ? consolidationProgress || "Preparando Excel…" : "Descargar Excel unificado"}
+                  </button>
+                </section>
+              )}
+            </section>
+          ) : activePage === "top-products" ? (
             <section className="top-products-screen">
               <div className="welcome-topline"><span className="eyebrow-dot" /> NUEVA FUNCIONALIDAD</div>
               <h1>Los 5 productos</h1>
